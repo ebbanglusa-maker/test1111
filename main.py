@@ -48,7 +48,7 @@ ai_client = AsyncOpenAI(
     base_url=AI_BASE_URL
 )
 
-def format_telegram_message(question: str, raw_answer: str) -> str:
+def format_telegram_message(question: str, raw_answer: str, mode: str = "normal") -> str:
     """Преобразует Markdown нейросети в аккуратный безопасный HTML для Telegram."""
     # Заменяем списки со звездочками (* пункт) и дефисы (- пункт) на точки (• пункт)
     clean_answer = re.sub(r'^[ \t]*[\*\-][ \t]+', '• ', raw_answer, flags=re.MULTILINE)
@@ -60,31 +60,50 @@ def format_telegram_message(question: str, raw_answer: str) -> str:
     # Превращаем **жирный текст** в <b>жирный текст</b>
     safe_a = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', safe_a)
 
-    return f"❓ <b>{safe_q}</b>\n\n🤖 {safe_a}"
+    icons = {
+        "short": "⚡",
+        "detailed": "📚",
+        "normal": "❓"
+    }
+    icon = icons.get(mode, "❓")
 
-async def ask_ai(prompt: str) -> str:
-    """Запрос к модели Gemma через OpenAI-совместимый API io.net."""
+    return f"{icon} <b>{safe_q}</b>\n\n🤖 {safe_a}"
+
+async def ask_ai(prompt: str, mode: str = "normal") -> str:
+    """Запрос к модели Gemma с настройкой стиля ответа."""
+    if mode == "short":
+        system_instruction = (
+            "Ты лаконичный AI-помощник. Ответь максимально кратко (1-3 емких предложения), "
+            "прямо по сути вопроса, без долгих вступлений и лишней воды на русском языке."
+        )
+        max_tokens = 300
+    elif mode == "detailed":
+        system_instruction = (
+            "Ты экспертный AI-помощник. Дай подробный, всесторонний и глубоко структурированный ответ на русском языке. "
+            "Разбей ответ на логические блоки, приведи ключевые факты и детали. "
+            "Для списков используй символ «•» вместо звездочек."
+        )
+        max_tokens = 1200
+    else:  # normal
+        system_instruction = (
+            "Ты умный и полезный AI-помощник. Отвечай сбалансированно, емко и по существу на русском языке. "
+            "Для списков используй символ «•» вместо звездочек."
+        )
+        max_tokens = 700
+
     try:
         response = await ai_client.chat.completions.create(
             model=AI_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты краткий, умный и полезный AI-помощник. "
-                        "Отвечай емко, понятно и по существу на русском языке. "
-                        "Для списков используй символ «•» вместо звездочек. "
-                        "Твой ответ будет сразу отправлен пользователем в чат."
-                    )
-                },
+                {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=800,
+            max_tokens=max_tokens,
             temperature=0.7
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Ошибка запроса к AI API: {e}")
+        logger.error(f"Ошибка запроса к AI API ({mode}): {e}")
         return f"Не удалось получить ответ от нейросети: {e}"
 
 @dp.message(CommandStart())
@@ -95,15 +114,16 @@ async def cmd_start(message: Message):
         "Ты можешь использовать меня в <b>любом</b> чате Telegram!\n\n"
         "Просто напиши в строке ввода любого чата:\n"
         "<code>@dmgemmabot твой вопрос?</code>\n\n"
-        "Например:\n"
-        "<code>@dmgemmabot что такое танк?</code>\n"
-        "<code>@dmgemmabot напиши формулу фотосинтеза</code>",
+        "Тебе будут доступны 3 режима ответа:\n"
+        "💬 <b>Обычный</b> — сбалансированный ответ\n"
+        "⚡ <b>Краткий</b> — 1-2 предложения без воды\n"
+        "📚 <b>Подробный</b> — развернутый анализ с фактами",
         parse_mode="HTML"
     )
 
 @dp.inline_query()
 async def handle_inline_query(query: InlineQuery):
-    """Мгновенная выдача подсказки (без задержки на генерацию ИИ)."""
+    """Выдает 3 карточки на выбор: Обычный, Краткий, Подробный."""
     user_text = query.query.strip()
 
     if len(user_text) < 2:
@@ -119,49 +139,81 @@ async def handle_inline_query(query: InlineQuery):
         await query.answer([item], cache_time=1, is_personal=True)
         return
 
-    # Заглушка, которая мгновенно отправляется в чат
-    initial_text = f"❓ <b>{html.escape(user_text)}</b>\n\n⏳ <i>Нейросеть генерирует ответ...</i>"
+    safe_q = html.escape(user_text)
+    timestamp = int(time.time() * 1000)
 
-    # Кнопка под сообщением (необходима для получения inline_message_id в Telegram)
+    # Клавиатура со статусом ожидания
     thinking_kb = InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(text="⏳ Генерация ответа...", callback_data="thinking")
         ]]
     )
 
-    result_id = hashlib.md5(f"{user_text}_{time.time()}".encode()).hexdigest()
-    item = InlineQueryResultArticle(
-        id=result_id,
-        title=f"Задать вопрос: {user_text[:35]}",
-        description="Нажмите, чтобы отправить вопрос в чат",
+    # 1. Обычный
+    card_normal = InlineQueryResultArticle(
+        id=f"normal:{timestamp}",
+        title="💬 Обычный ответ",
+        description=f"Сбалансированный ответ: {user_text[:35]}",
         reply_markup=thinking_kb,
         input_message_content=InputTextMessageContent(
-            message_text=initial_text,
+            message_text=f"❓ <b>{safe_q}</b>\n\n⏳ <i>Нейросеть генерирует ответ...</i>",
             parse_mode="HTML"
         )
     )
 
-    # cache_time=1 позволяет сразу обновлять запросы при изменении текста
-    await query.answer([item], cache_time=1, is_personal=True)
+    # 2. Краткий
+    card_short = InlineQueryResultArticle(
+        id=f"short:{timestamp}",
+        title="⚡ Краткий ответ",
+        description="1–3 предложения по сути, без лишней воды",
+        reply_markup=thinking_kb,
+        input_message_content=InputTextMessageContent(
+            message_text=f"⚡ <b>{safe_q}</b>\n\n⏳ <i>Генерирую краткий ответ...</i>",
+            parse_mode="HTML"
+        )
+    )
+
+    # 3. Подробный
+    card_detailed = InlineQueryResultArticle(
+        id=f"detailed:{timestamp}",
+        title="📚 Подробный ответ",
+        description="Развернутый анализ с деталями, фактами и пунктами",
+        reply_markup=thinking_kb,
+        input_message_content=InputTextMessageContent(
+            message_text=f"📚 <b>{safe_q}</b>\n\n⏳ <i>Генерирую подробный разбор...</i>",
+            parse_mode="HTML"
+        )
+    )
+
+    # Отправляем 3 карточки пользователю
+    await query.answer([card_normal, card_short, card_detailed], cache_time=1, is_personal=True)
 
 @dp.chosen_inline_result()
 async def handle_chosen_inline_result(chosen: ChosenInlineResult):
-    """Срабатывает в момент, когда пользователь нажал на карточку и сообщение улетело в чат."""
+    """Срабатывает при выборе одной из 3 карточек."""
     query_text = chosen.query.strip()
     inline_msg_id = chosen.inline_message_id
 
     if not inline_msg_id or not query_text:
         return
 
-    logger.info(f"Сообщение отправлено пользователем. Запрос: '{query_text}'. Генерируем ответ...")
+    # Определяем выбранный режим по префиксу id карточки
+    result_id = chosen.result_id or ""
+    if result_id.startswith("short:"):
+        mode = "short"
+    elif result_id.startswith("detailed:"):
+        mode = "detailed"
+    else:
+        mode = "normal"
 
-    # Получаем ответ от Gemma
-    ai_answer = await ask_ai(query_text)
+    logger.info(f"Выбран режим '{mode}' для запроса: '{query_text}'. Генерируем...")
 
-    # Формируем итоговый красивый HTML
-    final_text = format_telegram_message(query_text, ai_answer)
+    # Запрашиваем ответ у Gemma
+    ai_answer = await ask_ai(query_text, mode=mode)
 
-    # Кнопка под готовым сообщением для быстрого вызова бота другими участниками чата
+    # Форматируем итоговое сообщение
+    final_text = format_telegram_message(query_text, ai_answer, mode=mode)
+
     ready_kb = InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(text="✨ Спросить у @dmgemmabot", switch_inline_query_current_chat="")
@@ -169,19 +221,18 @@ async def handle_chosen_inline_result(chosen: ChosenInlineResult):
     )
 
     try:
-        # Редактируем уже отправленное сообщение в чате
         await bot.edit_message_text(
             inline_message_id=inline_msg_id,
             text=final_text,
             parse_mode="HTML",
             reply_markup=ready_kb
         )
-        logger.info("Сообщение успешно обновлено на готовый ответ!")
+        logger.info(f"Сообщение [{mode}] успешно обновлено!")
     except Exception as e:
         logger.error(f"Ошибка при редактировании сообщения: {e}")
 
 async def main():
-    logger.info("Запуск бота @dmgemmabot (режим мгновенной отправки + редактирования)...")
+    logger.info("Запуск бота @dmgemmabot (3 режима: Обычный / Краткий / Подробный)...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
